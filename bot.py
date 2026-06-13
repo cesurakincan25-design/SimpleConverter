@@ -16,16 +16,16 @@ from telegram.constants import ParseMode
 
 # ── Config ──────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+MAX_FILE_MB = 50
+DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "tg_downloader"
+DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-# ffmpeg binary — önce sistemde ara, yoksa imageio-ffmpeg'in kendi binary'sini kullan
+# ffmpeg binary
 FFMPEG = "ffmpeg"
 try:
     subprocess.run([FFMPEG, "-version"], capture_output=True, check=True)
 except (FileNotFoundError, subprocess.CalledProcessError):
     FFMPEG = _ffmpeg_pkg.get_ffmpeg_exe()
-MAX_FILE_MB = 50          # Telegram bot limit (free tier)
-DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "tg_downloader"
-DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 # ── URL patterns ─────────────────────────────────────────────────────────────
 TWITTER_RE = re.compile(
@@ -35,7 +35,6 @@ YOUTUBE_RE = re.compile(
     r"https?://(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[\w\-]+", re.IGNORECASE
 )
 
-
 def detect_platform(url: str) -> str | None:
     if TWITTER_RE.search(url):
         return "twitter"
@@ -43,14 +42,15 @@ def detect_platform(url: str) -> str | None:
         return "youtube"
     return None
 
-
 # ── yt-dlp helpers ────────────────────────────────────────────────────────────
-def ytdlp_download(url: str, output_path: str, extra_args: list[str]) -> tuple[bool, str]:
+def ytdlp_download(url: str, output_path: str, extra_args: list) -> tuple:
     """Run yt-dlp and return (success, filepath_or_error)."""
     cmd = [
         "yt-dlp",
         "--no-playlist",
         "--no-warnings",
+        "--add-header", "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "--add-header", "Accept-Language:en-US,en;q=0.9",
         "-o", output_path,
         *extra_args,
         url,
@@ -58,19 +58,31 @@ def ytdlp_download(url: str, output_path: str, extra_args: list[str]) -> tuple[b
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
         return False, result.stderr or result.stdout
-    # yt-dlp may add extension; find what it created
+
     parent = Path(output_path).parent
     stem = Path(output_path).stem
     matches = list(parent.glob(f"{stem}*"))
-    if matches:
-        return True, str(matches[0])
-    return False, "Dosya bulunamadı."
+
+    if not matches:
+        return False, "Dosya bulunamadı."
+
+    path = str(matches[0])
+
+    # HTML hata sayfası kontrolü
+    if path.endswith(".html") or path.endswith(".htm"):
+        Path(path).unlink(missing_ok=True)
+        return False, (
+            "Twitter bu videoyu indirmeye izin vermedi.\n"
+            "Tweet linkinin doğru formatta olduğunu kontrol et:\n"
+            "`twitter.com/.../status/123...` veya `x.com/.../status/123...`"
+        )
+
+    return True, path
 
 
-def video_to_gif(video_path: str, gif_path: str) -> tuple[bool, str]:
-    """Convert video → GIF using ffmpeg (palette trick for quality)."""
+def video_to_gif(video_path: str, gif_path: str) -> tuple:
+    """Convert video to GIF using ffmpeg palette trick."""
     palette = gif_path.replace(".gif", "_palette.png")
-    # Step 1: generate palette
     p1 = subprocess.run([
         FFMPEG, "-y", "-i", video_path,
         "-vf", "fps=12,scale=480:-1:flags=lanczos,palettegen",
@@ -78,7 +90,6 @@ def video_to_gif(video_path: str, gif_path: str) -> tuple[bool, str]:
     ], capture_output=True)
     if p1.returncode != 0:
         return False, p1.stderr.decode()
-    # Step 2: render GIF
     p2 = subprocess.run([
         FFMPEG, "-y", "-i", video_path, "-i", palette,
         "-lavfi", "fps=12,scale=480:-1:flags=lanczos[x];[x][1:v]paletteuse",
@@ -108,27 +119,23 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     platform = detect_platform(text)
 
     if not platform:
-        return  # mesajı ignore et, komut değil
+        return
 
     ctx.user_data["url"] = text
     ctx.user_data["platform"] = platform
 
     if platform == "twitter":
-        keyboard = [
-            [
-                InlineKeyboardButton("🎬 MP4", callback_data="dl:twitter:mp4"),
-                InlineKeyboardButton("🎞️ GIF", callback_data="dl:twitter:gif"),
-                InlineKeyboardButton("🎵 MP3", callback_data="dl:twitter:mp3"),
-            ]
-        ]
+        keyboard = [[
+            InlineKeyboardButton("🎬 MP4", callback_data="dl:twitter:mp4"),
+            InlineKeyboardButton("🎞️ GIF", callback_data="dl:twitter:gif"),
+            InlineKeyboardButton("🎵 MP3", callback_data="dl:twitter:mp3"),
+        ]]
         label = "Twitter/X"
     else:
-        keyboard = [
-            [
-                InlineKeyboardButton("🎬 MP4 (video)", callback_data="dl:youtube:mp4"),
-                InlineKeyboardButton("🎵 MP3 (ses)", callback_data="dl:youtube:mp3"),
-            ]
-        ]
+        keyboard = [[
+            InlineKeyboardButton("🎬 MP4 (video)", callback_data="dl:youtube:mp4"),
+            InlineKeyboardButton("🎵 MP3 (ses)", callback_data="dl:youtube:mp3"),
+        ]]
         label = "YouTube"
 
     await update.message.reply_text(
@@ -164,7 +171,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text(f"❌ Hata oluştu:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
     finally:
-        # Temizlik
         for f in DOWNLOAD_DIR.glob(f"{uid}_media*"):
             f.unlink(missing_ok=True)
 
@@ -178,20 +184,19 @@ async def _download_twitter(update, ctx, url, fmt, base, msg):
             "--merge-output-format", "mp4",
         ])
         if not ok:
-            await msg.edit_text(f"❌ MP4 indirilemedi:\n`{path}`", parse_mode=ParseMode.MARKDOWN)
+            await msg.edit_text(f"❌ MP4 indirilemedi:\n{path}", parse_mode=ParseMode.MARKDOWN)
             return
         await msg.edit_text("📤 Yükleniyor…")
         with open(path, "rb") as f:
             await ctx.bot.send_video(chat_id, f, caption="Twitter/X · MP4")
 
     elif fmt == "gif":
-        # Önce video indir, sonra GIF'e çevir
         ok, path = ytdlp_download(url, base + ".%(ext)s", [
             "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "--merge-output-format", "mp4",
         ])
         if not ok:
-            await msg.edit_text(f"❌ Video indirilemedi:\n`{path}`", parse_mode=ParseMode.MARKDOWN)
+            await msg.edit_text(f"❌ Video indirilemedi:\n{path}", parse_mode=ParseMode.MARKDOWN)
             return
         await msg.edit_text("🎞️ GIF'e dönüştürülüyor…")
         gif_path = base + ".gif"
@@ -201,7 +206,7 @@ async def _download_twitter(update, ctx, url, fmt, base, msg):
             return
         size_mb = Path(gif).stat().st_size / 1_048_576
         if size_mb > MAX_FILE_MB:
-            await msg.edit_text(f"⚠️ GIF boyutu çok büyük ({size_mb:.1f} MB > {MAX_FILE_MB} MB).\nMP4 olarak gönderiyorum…")
+            await msg.edit_text(f"⚠️ GIF çok büyük ({size_mb:.1f} MB), MP4 olarak gönderiyorum…")
             with open(path, "rb") as f:
                 await ctx.bot.send_video(chat_id, f, caption="Twitter/X · (GIF yerine MP4)")
         else:
@@ -214,7 +219,7 @@ async def _download_twitter(update, ctx, url, fmt, base, msg):
             "-x", "--audio-format", "mp3", "--audio-quality", "192K",
         ])
         if not ok:
-            await msg.edit_text(f"❌ Ses indirilemedi:\n`{path}`", parse_mode=ParseMode.MARKDOWN)
+            await msg.edit_text(f"❌ Ses indirilemedi:\n{path}", parse_mode=ParseMode.MARKDOWN)
             return
         await msg.edit_text("📤 Yükleniyor…")
         with open(path, "rb") as f:
@@ -232,14 +237,11 @@ async def _download_youtube(update, ctx, url, fmt, base, msg):
             "--merge-output-format", "mp4",
         ])
         if not ok:
-            await msg.edit_text(f"❌ Video indirilemedi:\n`{path}`", parse_mode=ParseMode.MARKDOWN)
+            await msg.edit_text(f"❌ Video indirilemedi:\n{path}", parse_mode=ParseMode.MARKDOWN)
             return
         size_mb = Path(path).stat().st_size / 1_048_576
         if size_mb > MAX_FILE_MB:
-            await msg.edit_text(
-                f"⚠️ Dosya boyutu {size_mb:.1f} MB — Telegram limiti {MAX_FILE_MB} MB.\n"
-                "Daha düşük kalitede tekrar deneniyor…"
-            )
+            await msg.edit_text(f"⚠️ {size_mb:.1f} MB — limit aşıldı, 480p deneniyor…")
             Path(path).unlink(missing_ok=True)
             ok, path = ytdlp_download(url, base + "_low.%(ext)s", [
                 "-f", "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/worst[ext=mp4]",
@@ -257,7 +259,7 @@ async def _download_youtube(update, ctx, url, fmt, base, msg):
             "-x", "--audio-format", "mp3", "--audio-quality", "192K",
         ])
         if not ok:
-            await msg.edit_text(f"❌ Ses indirilemedi:\n`{path}`", parse_mode=ParseMode.MARKDOWN)
+            await msg.edit_text(f"❌ Ses indirilemedi:\n{path}", parse_mode=ParseMode.MARKDOWN)
             return
         await msg.edit_text("📤 Yükleniyor…")
         with open(path, "rb") as f:
@@ -274,7 +276,6 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^dl:"))
     print("🤖 Bot başlatıldı…")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
