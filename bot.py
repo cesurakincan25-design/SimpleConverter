@@ -5,6 +5,8 @@ import tempfile
 import subprocess
 from pathlib import Path
 
+import imageio_ffmpeg as _ffmpeg_pkg
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -14,6 +16,13 @@ from telegram.constants import ParseMode
 
 # ── Config ──────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+
+# ffmpeg binary — önce sistemde ara, yoksa imageio-ffmpeg'in kendi binary'sini kullan
+FFMPEG = "ffmpeg"
+try:
+    subprocess.run([FFMPEG, "-version"], capture_output=True, check=True)
+except (FileNotFoundError, subprocess.CalledProcessError):
+    FFMPEG = _ffmpeg_pkg.get_ffmpeg_exe()
 MAX_FILE_MB = 50          # Telegram bot limit (free tier)
 DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "tg_downloader"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
@@ -63,7 +72,7 @@ def video_to_gif(video_path: str, gif_path: str) -> tuple[bool, str]:
     palette = gif_path.replace(".gif", "_palette.png")
     # Step 1: generate palette
     p1 = subprocess.run([
-        "ffmpeg", "-y", "-i", video_path,
+        FFMPEG, "-y", "-i", video_path,
         "-vf", "fps=12,scale=480:-1:flags=lanczos,palettegen",
         palette
     ], capture_output=True)
@@ -71,7 +80,7 @@ def video_to_gif(video_path: str, gif_path: str) -> tuple[bool, str]:
         return False, p1.stderr.decode()
     # Step 2: render GIF
     p2 = subprocess.run([
-        "ffmpeg", "-y", "-i", video_path, "-i", palette,
+        FFMPEG, "-y", "-i", video_path, "-i", palette,
         "-lavfi", "fps=12,scale=480:-1:flags=lanczos[x];[x][1:v]paletteuse",
         gif_path
     ], capture_output=True)
